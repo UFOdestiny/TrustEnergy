@@ -29,7 +29,7 @@ The deterministic baselines are inplemented based on
 [PDFormer](https://github.com/BUAABIGSCity/PDFormer), 
 [PowerPM](https://github.com/KimMeen/Time-LLM), 
 [Chronos](https://github.com/amazon-science/chronos-forecasting), 
-and [Moment](https://github.com/moment/moment).
+and [Moment](https://github.com/moment-timeseries-foundation-model/moment).
 
 The probabilistic baselines are inplemented based on 
 [STZINB](https://github.com/ZhuangDingyi/STZINB), 
