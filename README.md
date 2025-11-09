@@ -19,18 +19,22 @@ We conduct experiments on an Quad-Core 2.40GHz – Intel® Xeon X3220, 64 GB RAM
 
 ## 📊 Baselines  
 
-The deterministic baselines are inplemented based on [STGCN](https://github.com/hazdzz/STGCN),
-[DCRNN](https://github.com/chnsh/DCRNN_PyTorch), 
+The deterministic baselines are inplemented based on 
+[STGCN](https://github.com/hazdzz/STGCN),
 [GWNET](https://github.com/nnzhan/Graph-WaveNet), 
+[ASTGCN](https://github.com/guoshnBJTU/ASTGCN-2019-pytorch),
+[AGCRN](https://github.com/LeiBAI/AGCRN),
 [StemGNN](https://github.com/microsoft/StemGNN), 
 [DSTAGNN](https://github.com/SYLan2019/DSTAGNN), 
-[AGCRN](https://github.com/LeiBAI/AGCRN), and [SUMformer](https://github.com/Chengyui/SUMformer).
+[PDFormer](https://github.com/BUAABIGSCity/PDFormer), 
+[PowerPM](https://github.com/KimMeen/Time-LLM), 
+[Chronos](https://github.com/amazon-science/chronos-forecasting), 
+and [Moment](https://github.com/moment/moment).
 
 The probabilistic baselines are inplemented based on 
-[TimeGrad](https://github.com/zalandoresearch/pytorch-ts),
 [STZINB](https://github.com/ZhuangDingyi/STZINB), 
-[DeepSTUQ](https://github.com/WeizhuQIAN/DeepSTUQ_Pytorch), 
-[CF-GNN](https://github.com/snap-stanford/conformalized-gnn), and [DiffSTG](https://github.com/wenhaomin/DiffSTG).
+[DiffSTG](https://github.com/wenhaomin/DiffSTG),
+and [DeepSTUQ](https://github.com/WeizhuQIAN/DeepSTUQ_Pytorch). 
 
 
 ## 📖 Citation
