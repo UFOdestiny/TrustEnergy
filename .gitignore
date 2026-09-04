@@ -1,6 +1,36 @@
-.idea
-.vscode
-**/__pycache__
+# Data & results
+datasets/
+result/
+output/
+checkpoints/
+
+# Python
 __pycache__/
 *.py[cod]
-data
+*.so
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+
+# Environments
+venv/
+env/
+.venv/
+
+# Model weights & logs
+*.pt
+*.pth
+*.log
+*.err
+slurm-*.out
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Agent tooling
+.claude*
+CLAUDE*

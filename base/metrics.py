@@ -1,111 +1,396 @@
 import numpy as np
 import properscoring as ps
 import torch
-from torch.distributions.laplace import Laplace
-from torch.distributions.log_normal import LogNormal
-from torch.distributions.multivariate_normal import MultivariateNormal
-from torch.distributions.normal import Normal
 import torch.nn.functional as F
+from torch.distributions.multivariate_normal import MultivariateNormal
 
-zero = torch.tensor(0.0)
 
+# ---------------------------------------------------------------------------
+# Masking helpers
+# ---------------------------------------------------------------------------
+
+def get_mask(labels, null_val):
+    """Boolean-float mask: 1.0 where label is valid, 0.0 where null."""
+    if not torch.is_tensor(null_val):
+        null_val = torch.tensor(null_val, device=labels.device, dtype=labels.dtype)
+    else:
+        null_val = null_val.to(device=labels.device, dtype=labels.dtype)
+    if torch.isnan(null_val):
+        return (~torch.isnan(labels)).float()
+    return (labels != null_val).float()
+
+
+def _masked_mean(loss, mask):
+    """Mean of *loss* over positions where *mask* == 1, NaN-safe."""
+    count = mask.sum()
+    if count == 0:
+        return torch.tensor(0.0, device=loss.device)
+    out = loss * mask
+    out = torch.where(torch.isnan(out), torch.zeros_like(out), out)
+    return out.sum() / count
+
+
+
+# ---------------------------------------------------------------------------
+# Basic metrics  (signature: preds, labels, null_val)
+# ---------------------------------------------------------------------------
+
+def masked_mae(preds, labels, null_val):
+    assert preds.shape == labels.shape, f"preds {preds.shape} vs labels {labels.shape}"
+    return _masked_mean(torch.abs(preds - labels), get_mask(labels, null_val))
+
+
+def masked_mse(preds, labels, null_val):
+    assert preds.shape == labels.shape, f"preds {preds.shape} vs labels {labels.shape}"
+    return _masked_mean((preds - labels) ** 2, get_mask(labels, null_val))
+
+
+def masked_rmse(preds, labels, null_val):
+    return torch.sqrt(masked_mse(preds, labels, null_val))
+
+
+def masked_mape(preds, labels, null_val):
+    """MAPE with standard zero-masking (zeros excluded from denominator)."""
+    assert preds.shape == labels.shape, f"preds {preds.shape} vs labels {labels.shape}"
+    mask = get_mask(labels, labels.new_tensor(0.0))
+    loss = torch.abs(preds - labels) / torch.abs(labels).clamp(min=1e-8)
+    return _masked_mean(loss, mask) * 100
+
+
+def masked_f1(preds, labels, null_val):
+    """F1 for detecting active (strictly positive) targets.
+
+    OD demand is zero-inflated, so this treats each valid cell as a binary
+    active/inactive prediction: ``pred > 0`` versus ``label > 0``.  Returning
+    zero when precision and recall are both undefined makes all-empty batches
+    well-defined and keeps metric aggregation NaN-safe.
+    """
+    assert preds.shape == labels.shape, f"preds {preds.shape} vs labels {labels.shape}"
+    mask = get_mask(labels, null_val).bool()
+    predicted_active = (preds > 0) & mask
+    actual_active = (labels > 0) & mask
+    true_positive = (predicted_active & actual_active).sum().to(dtype=preds.dtype)
+    false_positive = (predicted_active & ~actual_active).sum().to(dtype=preds.dtype)
+    false_negative = (~predicted_active & actual_active).sum().to(dtype=preds.dtype)
+    denominator = 2 * true_positive + false_positive + false_negative
+    return torch.where(
+        denominator > 0,
+        2 * true_positive / denominator,
+        preds.new_tensor(0.0),
+    )
+
+
+def masked_kl(preds, labels, null_val):
+    """KL divergence between per-sample OD demand distributions.
+
+    Counts are normalized over all non-batch axes.  Empty true-demand samples
+    have no probability distribution and contribute zero; an all-zero forecast
+    against positive demand receives a large but finite penalty via ``eps``.
+    """
+    assert preds.shape == labels.shape, f"preds {preds.shape} vs labels {labels.shape}"
+    eps = torch.finfo(preds.dtype).eps
+    valid = get_mask(labels, null_val).bool()
+    target = torch.where(valid, labels.clamp_min(0.0), torch.zeros_like(labels))
+    forecast = torch.where(valid, preds.clamp_min(0.0), torch.zeros_like(preds))
+    flat_target, flat_forecast = target.reshape(target.shape[0], -1), forecast.reshape(forecast.shape[0], -1)
+    target_sum, forecast_sum = flat_target.sum(dim=1, keepdim=True), flat_forecast.sum(dim=1, keepdim=True)
+    p = flat_target / target_sum.clamp_min(eps)
+    q = flat_forecast / forecast_sum.clamp_min(eps)
+    terms = torch.where(p > 0, p * torch.log(p / q.clamp_min(eps)), torch.zeros_like(p))
+    per_sample = terms.sum(dim=1)
+    return torch.where(target_sum.squeeze(1) > 0, per_sample, torch.zeros_like(per_sample)).mean()
+
+
+def masked_crps(preds, labels, null_val):
+    """CRPS for an ensemble forecast, or MAE for a point-mass forecast."""
+    if preds.shape == labels.shape:
+        # CRPS of a deterministic (Dirac) forecast equals absolute error.
+        return masked_mae(preds, labels, null_val)
+    preds_np = preds.detach().cpu().numpy()
+    labels_np = labels.detach().cpu().numpy()
+    score = ps.crps_ensemble(labels_np, preds_np)
+    return torch.tensor(score.mean(), device=preds.device, dtype=preds.dtype)
+
+
+def masked_interval_crps(lower, upper, labels, null_val):
+    """CRPS of the uniform predictive distribution on ``[lower, upper]``.
+
+    Post-hoc conformal methods produce intervals rather than samples.  This
+    proper score reduces to MAE for a zero-width interval, so interval methods
+    can be compared without inventing pseudo-ensembles.
+    """
+    assert lower.shape == upper.shape == labels.shape
+    lo, hi = torch.minimum(lower, upper), torch.maximum(lower, upper)
+    width = hi - lo
+    below, above = labels < lo, labels > hi
+    inside = ((labels - lo).square() + (hi - labels).square()) / (2.0 * width.clamp_min(1e-8))
+    expected_abs = torch.where(below, (lo + hi) / 2.0 - labels, torch.where(above, labels - (lo + hi) / 2.0, inside))
+    score = expected_abs - width / 6.0
+    return _masked_mean(torch.where(width <= 1e-8, torch.abs(labels - lo), score), get_mask(labels, null_val))
+
+
+def masked_true_zero_rate(preds, labels, null_val):
+    """Zero-class recall: ``P(pred <= 0 | label == 0)`` over valid cells."""
+    assert preds.shape == labels.shape, f"preds {preds.shape} vs labels {labels.shape}"
+    valid_zero = (labels == 0) & get_mask(labels, null_val).bool()
+    count = valid_zero.sum()
+    if count == 0:
+        return preds.new_tensor(0.0)
+    return ((preds <= 0) & valid_zero).sum().to(dtype=preds.dtype) / count
+
+
+# ---------------------------------------------------------------------------
+# Interval / coverage metrics
+# ---------------------------------------------------------------------------
+
+def masked_mpiw(lower, upper, null_val=None):
+    return torch.mean(upper - lower)
+
+
+def masked_wink(lower, upper, labels, alpha=0.1):
+    zero = torch.tensor(0.0, device=lower.device)
+    score = (upper - lower
+             + (2 / alpha) * torch.maximum(lower - labels, zero)
+             + (2 / alpha) * torch.maximum(labels - upper, zero))
+    return torch.mean(score)
+
+
+def masked_coverage(lower, upper, labels, alpha=None):
+    in_range = ((labels >= lower) & (labels <= upper)).sum()
+    return in_range / labels.numel() * 100
+
+
+def masked_IS(lower, upper, labels, alpha=0.1):
+    """Interval Score (Gneiting & Raftery)."""
+    lower, upper, labels = lower.reshape(-1), upper.reshape(-1), labels.reshape(-1)
+    width = upper - lower
+    penalty = ((2.0 / alpha) * (lower - labels) * (labels < lower).float()
+               + (2.0 / alpha) * (labels - upper) * (labels > upper).float())
+    return (width + penalty).mean()
+
+
+# ---------------------------------------------------------------------------
+# Distribution / ensemble metrics
+# ---------------------------------------------------------------------------
+
+def mnormal_loss(preds, labels, null_val, scales):
+    """Multivariate normal negative log-likelihood."""
+    mask = get_mask(labels, null_val)
+    dis = MultivariateNormal(loc=preds, covariance_matrix=scales)
+    loss = dis.log_prob(labels)
+    if loss.shape == mask.shape:
+        loss = loss * mask
+        loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
+    return -torch.mean(loss)
+
+
+
+def zinb_nll(n, p, pi, y, null_val=float("nan"), eps=1e-8):
+    """Zero-Inflated Negative Binomial negative log-likelihood (Zhuang et al.,
+    KDD 2019/2021 — STZINB).
+
+    The distribution mixes a point mass at zero (weight ``pi``) with a
+    Negative-Binomial(``n``, ``p``) over counts:
+
+        P(y=0)  = pi + (1-pi) * p**n
+        P(y=k)  = (1-pi) * C(k+n-1, k) * p**n * (1-p)**k ,  k > 0
+
+    where ``n>0`` (dispersion), ``p in (0,1)`` (NB success prob), ``pi in (0,1)``
+    (zero-inflation).  Computed in the original count space; ``y`` must be the
+    inverse-transformed (count) labels.  NaN-masked and averaged over valid cells.
+    """
+    mask = get_mask(y, null_val)
+    p = p.clamp(eps, 1 - eps)
+    n = n.clamp(min=eps)
+    pi = pi.clamp(eps, 1 - eps)
+    y = torch.clamp(y, min=0.0)
+
+    # log NB pmf for the count y
+    log_nb = (
+        torch.lgamma(y + n)
+        - torch.lgamma(n)
+        - torch.lgamma(y + 1.0)
+        + n * torch.log(p)
+        + y * torch.log(1 - p)
+    )
+    # log P(y=0) under NB = n*log(p)
+    log_nb_zero = n * torch.log(p)
+
+    is_zero = (y < eps).float()
+    # log-sum-exp for the zero case: log(pi + (1-pi)*exp(log_nb_zero))
+    log_zero = torch.log(pi + (1 - pi) * torch.exp(log_nb_zero) + eps)
+    log_nonzero = torch.log(1 - pi) + log_nb
+    log_prob = is_zero * log_zero + (1 - is_zero) * log_nonzero
+
+    return _masked_mean(-log_prob, mask)
+
+
+def zinb_mean(n, p, pi, eps=1e-8):
+    """Point prediction (expected value) of the zero-inflated NB:
+    ``E[y] = (1 - pi) * n * (1 - p) / p``."""
+    p = p.clamp(eps, 1 - eps)
+    return (1 - pi) * n * (1 - p) / p
+
+
+def masked_quantile(y_lower, y_middle, y_upper, y_true,
+                    q_lower=0.05, q_upper=0.95, q_middle=0.5, lam=1.0):
+    mask = get_mask(y_true, y_true.new_tensor(float("nan")))
+    valid = mask.sum()
+    if valid.item() == 0:
+        return y_true.new_tensor(0.0)
+
+    quantiles = y_true.new_tensor([q_lower, q_middle, q_upper]).view(
+        -1, *[1] * y_true.ndim
+    )
+    preds = torch.stack([y_lower, y_middle, y_upper], dim=0)
+    errors = y_true.unsqueeze(0) - preds
+
+    pinball = torch.where(errors >= 0, quantiles * errors, (quantiles - 1) * errors)
+    pinball = pinball * mask.unsqueeze(0)
+    q_loss = pinball.sum() / valid * pinball.shape[0]
+
+    mono = F.relu(y_lower - y_middle) + F.relu(y_middle - y_upper)
+    mono_loss = (mono * mask).sum() / valid
+
+    return q_loss + lam * mono_loss
+
+
+
+# ---------------------------------------------------------------------------
+# Metric registry  (function, call-kind)
+# ---------------------------------------------------------------------------
+
+def _passthrough_scalar(preds, labels, null, value):
+    """Identity metric: records a scalar the caller already computed."""
+    return value
+
+
+_REGISTRY = {
+    "MAE":      (masked_mae,      "basic"),
+    "MSE":      (masked_mse,      "basic"),
+    "MAPE":     (masked_mape,     "basic"),
+    "F1":       (masked_f1,       "basic"),
+    "TZR":      (masked_true_zero_rate, "basic"),
+    "RMSE":     (masked_rmse,     "basic"),
+    "KL":       (masked_kl,       "basic"),
+    "CRPS":     (masked_crps,     "crps"),
+    "MGAU":     (mnormal_loss,    "scale"),
+    "MPIW":     (masked_mpiw,     "interval"),
+    "WINK":     (masked_wink,     "interval_target"),
+    "COV":      (masked_coverage, "interval_target"),
+    "IS":       (masked_IS,       "interval_target"),
+    "Quantile": (masked_quantile, "quantile"),
+    # Generic escape hatch: an engine with its own loss formula (e.g. a
+    # model-specific NLL) computes the scalar itself and reports it via
+    # ``compute_one_batch(..., value=loss_tensor)``.  Registering it under a
+    # fixed name lets ``loss_fn="NLL"`` drive early-stopping / best-checkpoint
+    # selection off that custom loss through the same Metrics machinery as any
+    # built-in metric, without every custom-loss model needing its own
+    # early-stop plumbing.
+    "NLL":      (_passthrough_scalar, "scalar"),
+}
+
+
+def register_metric(name, fn, kind):
+    """Register an additional custom metric under its own name (rather than
+    reusing the generic ``"NLL"`` passthrough above) — e.g. if two custom-loss
+    models need their values tracked side by side under distinct labels. Call
+    once at import time in the engine module, before any :class:`Metrics`
+    instance is constructed with that name.
+    """
+    _REGISTRY[name] = (fn, kind)
+
+
+def _dispatch(fn, kind, preds, labels, null, kw):
+    """Call a metric function according to its kind."""
+    if kind == "basic":
+        return fn(preds, labels, null)
+    if kind == "crps":
+        if "lower" in kw and "upper" in kw:
+            return masked_interval_crps(kw["lower"], kw["upper"], labels, null)
+        return fn(preds, labels, null)
+    if kind == "scale":
+        return fn(preds, labels, null, kw["scale"])
+    if kind == "interval":
+        return fn(kw["lower"], kw["upper"], null)
+    if kind == "interval_target":
+        return fn(kw["lower"], kw["upper"], labels, alpha=kw.get("alpha", 0.1))
+    if kind == "quantile":
+        return fn(
+            kw["lower"], preds, kw["upper"], labels,
+            q_lower=kw.get("q_lower", 0.05),
+            q_upper=kw.get("q_upper", 0.95),
+        )
+    if kind == "scalar":
+        return fn(preds, labels, null, kw["value"])
+    raise ValueError(f"Unknown metric kind: {kind}")
+
+
+def _to_scalar(value):
+    return value.detach().item() if torch.is_tensor(value) else float(value)
+
+
+def _align(value, ref):
+    """Ensure *value* is a tensor on the same device/dtype as *ref*."""
+    if torch.is_tensor(value):
+        return value.to(device=ref.device, dtype=ref.dtype)
+    return torch.tensor(value, device=ref.device, dtype=ref.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Metric tracker
+# ---------------------------------------------------------------------------
 
 class Metrics:
-    def __init__(self, loss_func, metric_lst, horizon=1, early_stop_method="MAE"):
-        self.dic = {
-            "MAE": masked_mae,
-            "MSE": masked_mse,
-            "MAPE": masked_mape,
-            "RMSE": masked_rmse,
-            "MPIW": masked_mpiw,
-            "CRPS": masked_crps,
-            "WINK": masked_wink,
-            "COV": masked_coverage,
-            "KL": masked_kl,
-            "MGAU": mnormal_loss,
-            "Quantile": masked_quantile,
-        }
+    """Accumulates per-batch metrics for train / valid / test splits
+    and formats human-readable epoch & test summaries."""
+
+    def __init__(self, loss_func, metric_lst, horizon=1):
+        seen, names = set(), []
+        for m in metric_lst:
+            if m not in _REGISTRY:
+                raise ValueError(f"Unknown metric: {m}")
+            if m not in seen:
+                names.append(m)
+                seen.add(m)
+        if loss_func not in seen:
+            names.insert(0, loss_func)
+
+        self.metric_lst = names
+        self.loss_name = loss_func
         self.horizon = horizon
+        self.N = len(names)
+        self.early_stop_method_index = names.index(loss_func)
 
-        self.metric_lst = [loss_func] + metric_lst
-        self.metric_func = [self.dic[i] for i in self.metric_lst]
-        early_stop_method = loss_func
-        self.early_stop_method_index = self.metric_lst.index(early_stop_method)
+        self._funcs = [_REGISTRY[n][0] for n in names]
+        self._kinds = [_REGISTRY[n][1] for n in names]
+        self._reset_metrics()
 
-        self.N = len(self.metric_lst)  # loss function
+    # -- accumulation -------------------------------------------------------
+
+    def _reset_metrics(self):
         self.train_res = [[] for _ in range(self.N)]
         self.valid_res = [[] for _ in range(self.N)]
-        self.test_res = [[] for _ in range(self.N)]
+        self.test_res  = [[] for _ in range(self.N)]
 
-        self.train_msg = None
-        self.test_msg = None
-        self.formatter()
+    _SPLITS = {"train": "train_res", "valid": "valid_res", "test": "test_res"}
 
-    def formatter(self):
-        self.train_msg = "Epoch: {:d}, Tr Loss: {:.3f}, "
-        for i in self.metric_lst[1:]:
-            self.train_msg += "Tr " + i + ": {:.3f}, "
-        self.train_msg += "V Loss: {:.3f}, "
-        for i in self.metric_lst[1:]:
-            self.train_msg += "V " + i + ": {:.3f}, "
-        self.train_msg += "Te Loss: {:.3f}, "
-        for i in self.metric_lst[1:]:
-            self.train_msg += "Te " + i + ": {:.3f}, "
-
-        self.train_msg += (
-            "LR: {:.4e}, Tr Time: {:.3f} s/epoch, V Time: {:.3f} s, Te Time: {:.3f} s"
-        )
-
-    # quantile=None, upper=None, lower=None
-    def compute_one_batch(self, preds, labels, null_val=None, mode="train", **kwargs):
+    def compute_one_batch(self, preds, labels, null_val, mode="train", **kw):
+        """Compute all metrics for one batch; returns the loss tensor for backprop
+        when *mode* == ``'train'``."""
+        null = _align(null_val, preds)
+        buf = getattr(self, self._SPLITS.get(mode, "test_res"))
         grad_res = None
-        for i, fname in enumerate(self.metric_lst):
-            res = None
-            if fname in ["MAE", "MSE", "MAPE", "RMSE", "KL", "CRPS"]:
-                res = self.metric_func[i](preds, labels, null_val)
 
-            elif fname in ["MGAU"]:
-                res = self.metric_func[i](preds, labels, null_val, kwargs["scale"])
-
-            elif fname in ["WINK", "COV"]:
-                res = self.metric_func[i](
-                    kwargs["lower"], kwargs["upper"], labels, alpha=0.1
-                )
-
-            elif fname in ["MPIW"]:
-                res = self.metric_func[i](kwargs["lower"], kwargs["upper"])
-
-            elif fname in ["Quantile"]:
-                res = self.metric_func[i](
-                    kwargs["lower"], preds, kwargs["upper"], labels
-                )
-            else:
-                raise ValueError("Invalid metric name")
-
-            if i == 0 and mode == "train":
-
-                grad_res = res
-
-                # res.backward()  # loss function
-
-            if mode == "train":
-                self.train_res[i].append(res.item())
-            elif mode == "valid":
-                self.valid_res[i].append(res.item())
-            else:
-                self.test_res[i].append(res.item())
+        for i, (fn, kind) in enumerate(zip(self._funcs, self._kinds)):
+            val = _dispatch(fn, kind, preds, labels, null, kw)
+            if self.metric_lst[i] == self.loss_name and mode == "train":
+                grad_res = val
+            buf[i].append(_to_scalar(val))
 
         return grad_res
 
-    def get_loss(self, mode="valid", method="MAE"):
-        index_ = self.metric_lst.index(method)
-
-        if mode == "train":
-            return self.train_res[index_]
-        elif mode == "valid":
-            return self.valid_res[index_]
-        else:
-            return self.test_res[index_]
+    # -- query --------------------------------------------------------------
 
     def get_valid_loss(self):
         return np.mean(self.valid_res[self.early_stop_method_index])
@@ -113,440 +398,49 @@ class Metrics:
     def get_test_loss(self):
         return np.mean(self.test_res[self.early_stop_method_index])
 
-    def get_epoch_msg(self, epoch, lr, training_time, valid_time, test_time):
-        # print([len(i) for i in self.train_res ])
-        # print([len(i) for i in self.valid_res])
+    # -- formatting ---------------------------------------------------------
 
-        train_lst = [np.mean(i) for i in self.train_res]
-        valid_lst = [np.mean(i) for i in self.valid_res]
-        test_lst = [np.mean(i) for i in self.test_res]
+    @staticmethod
+    def _fmt_metrics(prefix, names, values):
+        return [f"{prefix} {n}: {v:.3f}" for n, v in zip(names, values)]
 
-        msg = self.train_msg.format(
-            epoch,
-            *train_lst,
-            *valid_lst,
-            *test_lst,
-            lr,
-            training_time,
-            valid_time,
-            test_time,
-        )
+    def get_epoch_msg(
+        self, epoch, lr, training_time, valid_time, test_time, include_test=True
+    ):
+        """One-line epoch summary; resets accumulators."""
+        parts = [f"Epoch: {epoch}"]
+        splits = [("Tr", self.train_res), ("V", self.valid_res)]
+        if include_test:
+            splits.append(("Te", self.test_res))
 
-        self.train_res = [[] for _ in range(self.N)]
-        self.valid_res = [[] for _ in range(self.N)]
-        self.test_res = [[] for _ in range(self.N)]
-        return msg
+        for pfx, buf in splits:
+            parts += self._fmt_metrics(
+                pfx,
+                self.metric_lst,
+                [np.mean(v) if v else float("nan") for v in buf],
+            )
+        parts += [f"LR: {lr:.4e}",
+                  f"Tr Time: {training_time:.3f} s",
+                  f"V Time: {valid_time:.3f} s",
+                  f"Te Time: {test_time:.3f} s"]
+        self._reset_metrics()
+        return ", ".join(parts)
 
     def get_test_msg(self):
-        msgs = []
-        for i in range(self.horizon):
-            self.test_msg = f"Test Horizon: {i + 1}, "
-            for j in self.metric_lst:
-                self.test_msg += j + ": {:.3f}, "
-            self.test_msg = self.test_msg[:-2]  # remove the last ", "
-            test_lst = [k[i] for k in self.test_res]
-            msg = self.test_msg.format(*test_lst)
-            msgs.append(msg)
+        """Per-horizon test results; resets test accumulator."""
+        def _metric_str(values):
+            return ", ".join(f"{n}: {v:.3f}" for n, v in zip(self.metric_lst, values))
 
-        self.test_msg = f"Average: "
-        for i in self.metric_lst:
-            self.test_msg += i + ": {:.3f}, "
-        self.test_msg = self.test_msg[:-2]
-        test_lst = [np.mean(i) for i in self.test_res]
-        msg = self.test_msg.format(*test_lst)
-        msgs.append(msg)
+        msgs = []
+        for h in range(self.horizon):
+            vals = [buf[h] for buf in self.test_res]
+            msgs.append(f"Test Horizon: {h + 1}, {_metric_str(vals)}")
+
+        avgs = [np.mean(buf) for buf in self.test_res]
+        msgs.append(f"Average: {_metric_str(avgs)}")
 
         self.test_res = [[] for _ in range(self.N)]
         return msgs
 
     def export(self):
         return self.test_res
-
-
-def get_mask(labels, null_val):
-    if torch.isnan(null_val):
-        mask = ~torch.isnan(labels)
-    else:
-        mask = labels != null_val
-    mask = mask.float()
-    mask /= torch.mean(mask)
-    mask = torch.where(torch.isnan(mask), torch.zeros_like(mask), mask)
-    return mask
-
-
-def masked_pinball(preds, labels, null_val, quantile):
-    mask = get_mask(labels, null_val)
-
-    loss = torch.zeros_like(labels, dtype=torch.float)
-    error = preds - labels
-    smaller_index = error < 0
-    bigger_index = 0 < error
-    loss[smaller_index] = quantile * (abs(error)[smaller_index])
-    loss[bigger_index] = (1 - quantile) * (abs(error)[bigger_index])
-
-    # loss = loss * mask
-    # loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    return torch.mean(loss)
-
-
-def masked_mse(preds, labels, null_val):
-    # print(preds.shape, labels.shape)
-    # Batch size, Horizon, N, Features/N
-    assert preds.shape == labels.shape
-    # mask = get_mask(labels, null_val)
-
-    loss = (preds - labels) ** 2
-    # loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    return torch.mean(loss)
-
-
-def masked_rmse(preds, labels, null_val):
-    return torch.sqrt(masked_mse(preds=preds, labels=labels, null_val=null_val))
-
-
-def masked_mae(preds, labels, null_val):
-    # print("preds:", preds.shape, "labels:", labels.shape)
-    assert preds.shape == labels.shape
-    # mask = get_mask(labels, null_val)
-
-    loss = torch.abs(preds - labels)
-
-    # loss = loss * mask
-    # loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    return torch.mean(loss)
-
-
-def masked_mape(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-    loss = torch.abs(preds - labels) / labels
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    return torch.mean(loss) * 100  # percent
-
-
-def masked_kl(preds, labels, null_val):
-    # mask = get_mask(labels, null_val)
-
-    loss = labels * torch.log((labels + 1e-5) / (preds + 1e-5))
-
-    # loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    return torch.mean(loss)
-
-
-def masked_mpiw(lower, upper, null_val=None):
-    return torch.mean(upper - lower)
-
-
-def masked_wink(lower, upper, labels, alpha=0.1):
-    score = upper - lower
-    score += (2 / alpha) * torch.maximum(lower - labels, zero)
-    score += (2 / alpha) * torch.maximum(labels - upper, zero)
-    return torch.mean(score)
-
-
-def masked_coverage(lower, upper, labels, alpha=None):
-    in_the_range = torch.sum((labels >= lower) & (labels <= upper))
-    coverage = in_the_range / labels.numel() * 100
-    return coverage
-
-
-def masked_nonconf(lower, upper, labels):
-    return torch.maximum(lower - labels, labels - upper)
-
-
-def masked_mpiw_ens(preds, labels, null_val):
-    # mask = get_mask(labels, null_val)
-
-    m = torch.mean(preds, dim=list(range(1, preds.dim())))
-    # print(torch.min(preds),torch.quantile(m, 0.05),torch.mean(preds),torch.quantile(m, 0.95),torch.max(preds))
-
-    upper_bound = torch.quantile(m, 0.95)
-    lower_bound = torch.quantile(m, 0.05)
-    loss = upper_bound - lower_bound
-
-    return torch.mean(
-        loss
-    )  # -torch.mean(torch.quantile(m, 0.8)-torch.quantile(m, 0.2))
-
-
-def compute_all_metrics(preds, labels, null_val, lower=None, upper=None):
-    mae = masked_mae(preds, labels, null_val)
-    mape = masked_mape(preds, labels, null_val)
-    rmse = masked_rmse(preds, labels, null_val)
-
-    crps = masked_crps(preds, labels, null_val)
-    mpiw = masked_mpiw_ens(preds, labels, null_val)
-    kl = masked_kl(preds, labels, null_val)
-
-    res = [mae, rmse, mape, kl, mpiw, crps]
-
-    if lower is not None:
-        res[4] = masked_mpiw(lower, upper, null_val)
-        wink = masked_wink(lower, upper, labels)
-        cov = masked_coverage(lower, upper, labels)
-        res = res + [wink, cov]
-
-    return res
-
-
-def nb_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    n, p, pi = preds
-    pi = torch.clip(pi, 1e-3, 1 - 1e-3)
-    p = torch.clip(p, 1e-3, 1 - 1e-3)
-
-    idx_yeq0 = labels <= 0
-    idx_yg0 = labels > 0
-
-    n_yeq0 = n[idx_yeq0]
-    p_yeq0 = p[idx_yeq0]
-    pi_yeq0 = pi[idx_yeq0]
-    yeq0 = labels[idx_yeq0]
-
-    n_yg0 = n[idx_yg0]
-    p_yg0 = p[idx_yg0]
-    pi_yg0 = pi[idx_yg0]
-    yg0 = labels[idx_yg0]
-
-    lambda_ = 1e-4
-
-    L_yeq0 = torch.log(pi_yeq0 + lambda_) + torch.log(
-        lambda_ + (1 - pi_yeq0) * torch.pow(p_yeq0, n_yeq0)
-    )
-    L_yg0 = (
-        torch.log(1 - pi_yg0 + lambda_)
-        + torch.lgamma(n_yg0 + yg0)
-        - torch.lgamma(yg0 + 1)
-        - torch.lgamma(n_yg0 + lambda_)
-        + n_yg0 * torch.log(p_yg0 + lambda_)
-        + yg0 * torch.log(1 - p_yg0 + lambda_)
-    )
-
-    loss = -torch.sum(L_yeq0) - torch.sum(L_yg0)
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-    return torch.sum(loss)
-
-
-def nb_nll_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    n, p, pi = preds
-
-    idx_yeq0 = labels <= 0
-    idx_yg0 = labels > 0
-
-    n_yeq0 = n[idx_yeq0]
-    p_yeq0 = p[idx_yeq0]
-    pi_yeq0 = pi[idx_yeq0]
-    yeq0 = labels[idx_yeq0]
-
-    n_yg0 = n[idx_yg0]
-    p_yg0 = p[idx_yg0]
-    pi_yg0 = pi[idx_yg0]
-    yg0 = labels[idx_yg0]
-
-    index1 = p_yg0 == 1
-    p_yg0[index1] = torch.tensor(0.9999)
-    index2 = pi_yg0 == 1
-    pi_yg0[index2] = torch.tensor(0.9999)
-    index3 = pi_yeq0 == 1
-    pi_yeq0[index3] = torch.tensor(0.9999)
-    index4 = pi_yeq0 == 0
-    pi_yeq0[index4] = torch.tensor(0.001)
-
-    L_yeq0 = torch.log(pi_yeq0) + torch.log((1 - pi_yeq0) * torch.pow(p_yeq0, n_yeq0))
-    L_yg0 = (
-        torch.log(1 - pi_yg0)
-        + torch.lgamma(n_yg0 + yg0)
-        - torch.lgamma(yg0 + 1)
-        - torch.lgamma(n_yg0)
-        + n_yg0 * torch.log(p_yg0)
-        + yg0 * torch.log(1 - p_yg0)
-    )
-
-    loss = -torch.sum(L_yeq0) - torch.sum(L_yg0)
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-    return torch.sum(loss)
-
-
-def gaussian_nll_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    loc, scale = preds
-    var = torch.pow(scale, 2)
-    loss = (labels - loc) ** 2 / var + torch.log(2 * torch.pi * var)
-
-    # pi = torch.acos(torch.zeros(1)).item() * 2
-    # loss = 0.5 * (torch.log(2 * torch.pi * var) + (torch.pow(labels - loc, 2) / var))
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    loss = torch.sum(loss)
-    return loss
-
-
-def laplace_nll_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    loc, scale = preds
-    loss = torch.log(2 * scale) + torch.abs(labels - loc) / scale
-
-    # d = torch.distributions.poisson.Poisson
-    # loss = d.log_prob(labels)
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    loss = torch.sum(loss)
-    return loss
-
-
-def mnormal_loss(preds, labels, null_val, scales):
-    mask = get_mask(labels, null_val)
-
-    loc, scale = preds, scales
-
-    dis = MultivariateNormal(loc=loc, covariance_matrix=scale)
-    loss = dis.log_prob(labels)
-
-    if loss.shape == mask.shape:
-        loss = loss * mask
-        loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    # loss = -torch.sum(loss)
-    loss = -torch.mean(loss)
-    return loss
-
-
-def mnb_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    mu, r = preds
-
-    term1 = torch.lgamma(labels + r) - torch.lgamma(r) - torch.lgamma(labels + 1)
-    term2 = r * torch.log(r) + labels * torch.log(mu)
-    term3 = -(labels + r) * torch.log(r + mu)
-    loss = term1 + term2 + term3
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    loss = -torch.sum(loss)
-    return loss
-
-
-def normal_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    loc, scale = preds
-    d = Normal(loc, scale)
-    loss = d.log_prob(labels)
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    loss = -torch.sum(loss)
-    return loss
-
-
-def lognormal_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    loc, scale = preds
-
-    dis = LogNormal(loc, scale)
-    loss = dis.log_prob(labels + 0.000001)
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    loss = -torch.sum(loss)
-    return loss
-
-
-def tnormal_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    loc, scale = preds
-
-    d = Normal(loc, scale)
-    prob0 = d.cdf(torch.Tensor([0]).to(labels.device))
-    loss = d.log_prob(labels) - torch.log(1 - prob0)
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    loss = -torch.sum(loss)
-    return loss
-
-
-def laplace_loss(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    loc, scale = preds
-
-    d = Laplace(loc, scale)
-    loss = d.log_prob(labels)
-
-    loss = loss * mask
-    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
-
-    loss = -torch.sum(loss)
-    return loss
-
-
-def masked_crps(preds, labels, null_val):
-    mask = get_mask(labels, null_val)
-
-    # m, v = preds
-    # if v.shape != m.shape:
-    #     v = torch.diagonal(v, dim1=-2, dim2=-1)
-
-    # loss = ps.crps_gaussian(labels, mu=m, sig=v)
-    loss = ps.crps_ensemble(labels.cpu().numpy(), preds.cpu().detach().numpy())
-
-    return loss.mean()
-
-
-def masked_quantile(
-    y_lower,
-    y_middle,
-    y_upper,
-    y_true,
-    q_lower=0.05,
-    q_upper=0.95,
-    q_middle=0.5,
-    lam=1.0,
-):
-
-    def quantile_loss_(pred, target, quantile):
-        error = target - pred
-        return torch.max((quantile - 1) * error, quantile * error).mean()
-
-    def monotonicity_loss(y_lower, y_middle, y_upper, margin=0.0):
-        loss = F.relu(y_lower - y_middle + margin) + F.relu(y_middle - y_upper + margin)
-        return loss.mean()
-
-    loss_lower = quantile_loss_(y_lower, y_true, q_lower)
-    loss_middle = quantile_loss_(y_middle, y_true, q_middle)
-    loss_upper = quantile_loss_(y_upper, y_true, q_upper)
-    loss_monotonic = monotonicity_loss(y_lower, y_middle, y_upper)
-    return loss_lower + loss_middle + loss_upper + lam * loss_monotonic
-
-
-if __name__ == "__main__":
-    f = "Epoch: {:d}, T Loss: {:.3f},T Loss: {:.3f},T Loss: {:.3f}"
-    print(f.format(1, *[1, 1, 1]))

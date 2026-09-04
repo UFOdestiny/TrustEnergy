@@ -1,0 +1,28 @@
+# Dataset registry — maps a dataset name to its data / adjacency paths.
+#
+# Paths are relative to the data root, which defaults to `<repo>/datasets`
+# and can be overridden with the POPST_DATA environment variable.
+# The node count is read from each `<years>/info.json` at load time, so it
+# is never declared here.
+
+nyc_manhattan_15min:
+  data: nyc_manhattan_15min
+  adj: nyc_manhattan_15min/Manhattan.npy
+
+chicago_15min:
+  data: chicago_15min
+  adj: chicago_15min/chicago.npy
+
+dc_60min:
+  data: dc_60min
+  adj: dc_60min/dc.npy
+
+sf_15min:
+  data: sf_15min
+  adj: sf_15min/sf.npy
+
+# Add your own dataset by pointing at a folder produced by utils/generate.py:
+#
+# MyDataset:
+#   data: MyDataset
+#   adj: MyDataset/adj.npy
